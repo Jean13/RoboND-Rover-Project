@@ -1,4 +1,3 @@
-# Do the necessary imports
 import argparse
 import shutil
 import base64
@@ -21,18 +20,26 @@ import time
 from perception import perception_step
 from decision import decision_step
 from supporting_functions import update_rover, create_output_images
-# Initialize socketio server and Flask application 
-# (learn more at: https://python-socketio.readthedocs.io/en/latest/)
+
+'''
+Initialize socketio server and Flask application
+(learn more at: https://python-socketio.readthedocs.io/en/latest/)
+'''
 sio = socketio.Server()
 app = Flask(__name__)
 
-# Read in ground truth map and create 3-channel green version for overplotting
-# NOTE: images are read in by default with the origin (0, 0) in the upper left
-# and y-axis increasing downward.
+'''
+Read in ground truth map and create 3-channel green version for overplotting
+NOTE: images are read in by default with the origin (0, 0) in the upper left
+and y-axis increasing downward.
+'''
 ground_truth = mpimg.imread('../calibration_images/map_bw.png')
-# This next line creates arrays of zeros in the red and blue channels
-# and puts the map into the green channel.  This is why the underlying 
-# map output looks green in the display image
+
+'''
+This next line creates arrays of zeros in the red and blue channels
+and puts the map into the green channel.  This is why the underlying
+map output looks green in the display image
+'''
 ground_truth_3d = np.dstack((ground_truth*0, ground_truth*255, ground_truth*0)).astype(np.float)
 
 # Define RoverState() class to retain rover state parameters
@@ -42,6 +49,7 @@ class RoverState():
         self.total_time = None # To record total duration of naviagation
         self.img = None # Current camera image
         self.pos = None # Current position (x, y)
+        self.start_pos = None # Starting position (x, y)
         self.yaw = None # Current yaw angle
         self.pitch = None # Current pitch angle
         self.roll = None # Current roll angle
@@ -55,27 +63,49 @@ class RoverState():
         self.mode = 'forward' # Current mode (can be forward or stop)
         self.throttle_set = 0.2 # Throttle setting when accelerating
         self.brake_set = 10 # Brake setting when braking
-        # The stop_forward and go_forward fields below represent total count
-        # of navigable terrain pixels.  This is a very crude form of knowing
-        # when you can keep going and when you should stop.  Feel free to
-        # get creative in adding new fields or modifying these!
+
+        '''
+        The stop_forward and go_forward fields below represent total count
+        of navigable terrain pixels.  This is a very crude form of knowing
+        when you can keep going and when you should stop.  Feel free to
+        get creative in adding new fields or modifying these!
+        '''
         self.stop_forward = 50 # Threshold to initiate stopping
-        self.go_forward = 500 # Threshold to go forward again
-        self.max_vel = 2 # Maximum velocity (meters/second)
-        # Image output from perception step
-        # Update this image to display your intermediate analysis steps
-        # on screen in autonomous mode
-        self.vision_image = np.zeros((160, 320, 3), dtype=np.float) 
-        # Worldmap
-        # Update this image with the positions of navigable terrain
-        # obstacles and rock samples
-        self.worldmap = np.zeros((200, 200, 3), dtype=np.float) 
+        self.go_forward = 500 # Threshold to go forward again; original 500
+        self.max_vel = 3 # Maximum velocity (meters/second)
+        self.max_throttle = 1 # Maximum throttle
+
+        '''
+        Image output from perception step
+        Update this image to display your intermediate analysis steps
+        on screen in autonomous mode
+        '''
+        self.vision_image = np.zeros((160, 320, 3), dtype=np.float)
+
+        '''
+        Worldmap
+        Update this image with the positions of navigable terrain
+        obstacles and rock samples
+        '''
+        self.worldmap = np.zeros((200, 200, 3), dtype=np.float)
+        self.rock_angles = None # Angles of rock pixels
+        self.rock_dists = None # Distances of rock pixels
         self.samples_pos = None # To store the actual sample positions
         self.samples_found = 0 # To count the number of samples found
         self.near_sample = 0 # Will be set to telemetry value data["near_sample"]
+        self.near_sample_count = 0 # Keep track of rock-picking progress
         self.picking_up = 0 # Will be set to telemetry value data["picking_up"]
         self.send_pickup = False # Set to True to trigger rock pickup
-# Initialize our rover 
+        self.timeout_after_pickup = 200
+        self.samples_recovered = 0 # Manual tally of samples collected
+        self.home_dist = 0 # Distance to home
+        self.angle_error = 0 # Yaw angle error to home
+        self.turn_home = False # Initial turning state at beginning of going home
+        self.time_start = time.time() # Initial starting time when rover is stuck
+        self.count = 0 # Keep track of progress
+
+
+# Initialize our rover
 Rover = RoverState()
 
 # Variables to track frames per second (FPS)
@@ -109,6 +139,7 @@ def telemetry(sid, data):
             # Execute the perception and decision steps to update the Rover's state
             Rover = perception_step(Rover)
             Rover = decision_step(Rover)
+            Rover.count += 1
 
             # Create output images to send to server
             out_image_string1, out_image_string2 = create_output_images(Rover)
@@ -116,7 +147,7 @@ def telemetry(sid, data):
             # The action step!  Send commands to the rover!
             commands = (Rover.throttle, Rover.brake, Rover.steer)
             send_control(commands, out_image_string1, out_image_string2)
- 
+
             # If in a state where want to pickup a rock send pickup command
             if Rover.send_pickup:
                 send_pickup()
@@ -128,9 +159,11 @@ def telemetry(sid, data):
             # Send zeros for throttle, brake and steer and empty images
             send_control((0, 0, 0), '', '')
 
-        # If you want to save camera images from autonomous driving specify a path
-        # Example: $ python drive_rover.py image_folder_path
-        # Conditional to save image frame if folder was specified
+        '''
+        If you want to save camera images from autonomous driving specify a path
+        Example: $ python drive_rover.py image_folder_path
+        Conditional to save image frame if folder was specified
+        '''
         if args.image_folder != '':
             timestamp = datetime.utcnow().strftime('%Y_%m_%d_%H_%M_%S_%f')[:-3]
             image_filename = os.path.join(args.image_folder, timestamp)
@@ -163,8 +196,8 @@ def send_control(commands, image_string1, image_string2):
         "data",
         data,
         skip_sid=True)
-
-# Define a function to send the "pickup" command 
+    eventlet.sleep(0)
+# Define a function to send the "pickup" command
 def send_pickup():
     print("Picking up")
     pickup = {}
@@ -172,7 +205,7 @@ def send_pickup():
         "pickup",
         pickup,
         skip_sid=True)
-
+    eventlet.sleep(0)
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Remote Driving')
     parser.add_argument(
@@ -183,7 +216,7 @@ if __name__ == '__main__':
         help='Path to image folder. This is where the images from the run will be saved.'
     )
     args = parser.parse_args()
-    
+
     os.system('rm -rf IMG_stream/*')
     if args.image_folder != '':
         print("Creating image folder at {}".format(args.image_folder))
@@ -195,7 +228,7 @@ if __name__ == '__main__':
         print("Recording this run ...")
     else:
         print("NOT recording this run ...")
-    
+
     # wrap Flask application with socketio's middleware
     app = socketio.Middleware(sio, app)
 
